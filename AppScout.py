@@ -440,6 +440,37 @@ def best_player_for_role(role_scores, role, used_players):
                 return jugador
 
     return "—"
+def player_percentiles(players, player_name, role):
+
+    metrics = roles_metrics.get(role, [])
+    if not metrics:
+        return pd.DataFrame()
+
+    row = players[players["Jugador"] == player_name]
+    if row.empty:
+        return pd.DataFrame()
+
+    row = row.iloc[0]
+
+    data = []
+
+    for m in metrics:
+        if m not in players.columns:
+            continue
+
+        distribution = players[m].dropna()
+        if len(distribution) == 0:
+            continue
+
+        player_value = row[m]
+        percentile = (distribution < player_value).mean() * 100
+
+        data.append({
+            "Métrica": m,
+            "Percentil": round(percentile, 1)
+        })
+
+    return pd.DataFrame(data)
 
 
 def draw_pitch():
@@ -614,6 +645,7 @@ def plot_formation(formacion, alineacion):
         )
 
     st.pyplot(fig)
+    
 # ==========================================================
 # UI
 # ==========================================================
@@ -629,10 +661,43 @@ if files:
 
     players = load_data(files)
 
-    if "Minutos jugados" not in players.columns:
-        st.error("Falta columna 'Minutos jugados'")
-        st.stop()
+    players = load_data(files)
 
+    # =========================
+    # FILTROS AQUÍ
+    # =========================
+    st.sidebar.divider()
+    st.sidebar.subheader("🔎 Filtros")
+
+    if "Edad" in players.columns:
+        edad_min, edad_max = st.sidebar.slider(
+            "Edad",
+            int(players["Edad"].min()),
+            int(players["Edad"].max()),
+            (18, 35)
+        )
+        players = players[
+            (players["Edad"] >= edad_min) &
+            (players["Edad"] <= edad_max)
+        ]
+
+    col_pos = "Posición" if "Posición" in players.columns else None
+    if col_pos:
+        posiciones = sorted(players[col_pos].dropna().unique().tolist())
+        pos_sel = st.sidebar.multiselect("Posición", posiciones)
+        if pos_sel:
+            players = players[players[col_pos].isin(pos_sel)]
+
+    col_pie = "Pie" if "Pie" in players.columns else None
+    if col_pie:
+        pies = sorted(players[col_pie].dropna().unique().tolist())
+        pie_sel = st.sidebar.multiselect("Pie dominante", pies)
+        if pie_sel:
+            players = players[players[col_pie].isin(pie_sel)]
+
+    # =========================
+    # MINUTOS
+    # =========================
     min_minutes = st.sidebar.slider(
         "Minutos mínimos",
         0,
@@ -640,16 +705,22 @@ if files:
         300
     )
 
+    # =========================
+    # SCORING
+    # =========================
     role_scores = compute_role_scores(players, min_minutes)
+
     
     # =========================
     # TABS
     # =========================
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "🏆 Rankings",
         "🕷 Radar",
-        "📋 Alineación"
+        "📋 Alineación",
+        "📊 Percentiles"
     ])
+
 
     # ------------------------------------------------------
     # TAB 1 — RANKINGS
@@ -797,3 +868,40 @@ if files:
             plot_formation(formacion, alineacion)
         else:
             st.info("No hay coordenadas definidas para esta formación.")
+    # ------------------------------------------------------
+    # TAB 4 — PERCENTILES
+    # ------------------------------------------------------
+    with tab4:
+
+        st.subheader("Percentiles por Jugador")
+
+        if role_scores:
+
+            all_players = players["Jugador"].unique().tolist()
+            selected_player = st.selectbox(
+                "Jugador",
+                all_players,
+                key="percent_player"
+            )
+
+            selected_role = st.selectbox(
+                "Rol",
+                list(role_scores.keys()),
+                key="percent_role"
+            )
+
+            df_percent = player_percentiles(
+                players,
+                selected_player,
+                selected_role
+            )
+
+            if not df_percent.empty:
+                st.dataframe(df_percent, use_container_width=True)
+
+                # mini gráfico
+                st.bar_chart(
+                    df_percent.set_index("Métrica")
+                )
+            else:
+                st.warning("Sin datos para este jugador.")
