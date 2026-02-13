@@ -28,8 +28,7 @@ pesos_roles_mejorados = {
         "Porterías imbatidas en los 90": 0.08,
         "Duelos aéreos en los 90": 0.03,
         "Pases hacia adelante/90": 0.015,
-        "Precisión pases, %": 0.01,
-        "Pases hacia atrás recibidos del arquero/90": 0.005
+        "Precisión pases, %": 0.015   
     },
 
     "Portero_Avanzado": {
@@ -328,7 +327,6 @@ def normalize_positions(pos_string):
 # ==========================================================
 
 @st.cache_data
-@st.cache_data
 def load_data(files):
     dfs = [pd.read_excel(f) for f in files]
     df = pd.concat(dfs, ignore_index=True)
@@ -403,9 +401,80 @@ def compute_role_scores(players, min_minutes):
 
     return role_scores
 
+def best_roles_for_player(player_name, players, top_n=3):
 
+    results = []
+
+    for rol, weights in pesos_roles_mejorados.items():
+
+        metrics = [m for m in weights if m in players.columns]
+        if not metrics:
+            continue
+
+        df_norm = percentile_normalization(players, metrics)
+        row = df_norm[df_norm["Jugador"] == player_name]
+
+        if row.empty:
+            continue
+
+        row = row.iloc[0]
+        score = sum(row[m] * weights[m] for m in metrics if not pd.isna(row[m]))
+
+        results.append((rol, round(score * 10, 2)))
+
+    results = sorted(results, key=lambda x: x[1], reverse=True)
+    return results[:top_n]
+
+def best_roles_for_player_smart(player_name, players, min_minutes, top_n=3):
+
+    df = players[players["Minutos jugados"] >= min_minutes].copy()
+    results = []
+
+    # --- Detectar posición del jugador ---
+    player_row = df[df["Jugador"] == player_name]
+    if player_row.empty:
+        return []
+
+    player_positions = player_row.iloc[0]["Pos_norm"]
+
+    is_gk = "GK" in player_positions
+
+    # --- Definir roles permitidos ---
+    if is_gk:
+        allowed_roles = ["Portero", "Portero_Avanzado"]
+    else:
+        allowed_roles = list(pesos_roles_mejorados.keys())
+
+    # --- Calcular scores ---
+    for rol in allowed_roles:
+
+        weights = pesos_roles_mejorados[rol]
+        metrics = [m for m in weights if m in df.columns]
+
+        if not metrics:
+            continue
+
+        df_norm = percentile_normalization(df, metrics)
+        row = df_norm[df_norm["Jugador"] == player_name]
+
+        if row.empty:
+            continue
+
+        row = row.iloc[0]
+        score = sum(row[m] * weights[m] for m in metrics if not pd.isna(row[m]))
+
+        results.append((rol, round(score * 10, 2)))
+
+    results = sorted(results, key=lambda x: x[1], reverse=True)
+
+    # GK solo 2 roles
+    if is_gk:
+        return results[:2]
+
+    return results[:top_n]
 
 def radar_plot(df, role, players_selected):
+
     metrics = roles_metrics[role]
     df_norm = percentile_normalization(df, metrics)
 
@@ -413,22 +482,180 @@ def radar_plot(df, role, players_selected):
     angles = np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
     angles += angles[:1]
 
-    fig, ax = plt.subplots(figsize=(6,6), subplot_kw=dict(polar=True))
+    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
 
-    for player in players_selected:
+    # FONDO CLARO
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("#f5f5f5")
+
+    colors = ["#1f77b4", "#ff7f0e", "#2ecc71", "#e74c3c"]
+
+    for i, player in enumerate(players_selected):
+
         row = df_norm[df_norm["Jugador"] == player]
         if row.empty:
             continue
+
         values = row[metrics].iloc[0].tolist()
         values += values[:1]
-        ax.plot(angles, values, label=player)
-        ax.fill(angles, values, alpha=0.25)
+
+        ax.plot(
+            angles,
+            values,
+            linewidth=2.5,
+            color=colors[i % len(colors)],
+            label=player
+        )
+
+        ax.fill(
+            angles,
+            values,
+            alpha=0.15,
+            color=colors[i % len(colors)]
+        )
+
+    # ETIQUETAS REALES (sin recortar)
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(metrics, fontsize=10, color="black")
+
+    ax.set_ylim(0, 1)
+
+    # REJILLA SUAVE
+    ax.yaxis.grid(True, color="gray", alpha=0.25)
+    ax.xaxis.grid(True, color="gray", alpha=0.25)
+
+    # QUITAR NÚMEROS RADIALES
+    ax.set_yticklabels([])
+
+    # LEYENDA ABAJO Y VISIBLE
+    plt.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.08),
+        ncol=2,
+        frameon=False,
+        fontsize=11
+    )
+
+    # TÍTULO SIMPLE
+    plt.title(
+        f"Radar comparativo – {role}",
+        fontsize=14,
+        pad=20
+    )
+
+    plt.tight_layout()
+    st.pyplot(fig)
+    
+def radar_vs_role_top_player(players, player_name, role, min_minutes):
+
+    df = players[players["Minutos jugados"] >= min_minutes].copy()
+
+    metrics = roles_metrics[role]
+    metrics = [m for m in metrics if m in df.columns]
+
+    if not metrics:
+        return
+
+    df_norm = percentile_normalization(df, metrics)
+
+    player_row = df_norm[df_norm["Jugador"] == player_name]
+    if player_row.empty:
+        return
+
+    # MEJOR JUGADOR DEL ROL POR SCORE
+    weights = pesos_roles_mejorados[role]
+
+    scores = []
+    for _, row in df_norm.iterrows():
+        s = sum(row[m] * weights[m] for m in metrics if not pd.isna(row[m]))
+        scores.append(s)
+
+    df_norm["Score"] = scores
+    top_player = df_norm.sort_values("Score", ascending=False).iloc[0]["Jugador"]
+
+    top_row = df_norm[df_norm["Jugador"] == top_player]
+
+    p_vals = player_row.iloc[0][metrics].tolist()
+    t_vals = top_row.iloc[0][metrics].tolist()
+
+    angles = np.linspace(0, 2*np.pi, len(metrics), endpoint=False).tolist()
+    angles += angles[:1]
+
+    p_vals += p_vals[:1]
+    t_vals += t_vals[:1]
+
+    fig, ax = plt.subplots(figsize=(5,5), subplot_kw=dict(polar=True))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("#f4f4f4")
+
+    ax.plot(angles, p_vals, linewidth=2, label=player_name)
+    ax.fill(angles, p_vals, alpha=0.15)
+
+    ax.plot(angles, t_vals, linewidth=2, linestyle="--", label=f"Top {role}")
+    ax.fill(angles, t_vals, alpha=0.1)
 
     ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(metrics)
+    ax.set_xticklabels(metrics, fontsize=8)
     ax.set_ylim(0,1)
-    plt.legend()
+    ax.set_yticklabels([])
+
+    ax.grid(alpha=0.25)
+
+    plt.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.15),
+        frameon=False,
+        fontsize=8
+    )
+
+    plt.tight_layout()
     st.pyplot(fig)
+
+    
+def radar_vs_role_best(players_df, player_name, role):
+    metrics = roles_metrics[role]
+
+    df_role = players_df.copy()
+
+    # normalizamos todo el rol
+    df_norm = percentile_normalization(df_role, metrics)
+
+    # jugador seleccionado
+    player_row = df_norm[df_norm["Jugador"] == player_name]
+    if player_row.empty:
+        st.warning("Jugador no encontrado")
+        return
+
+    player_values = player_row.iloc[0][metrics].tolist()
+
+    # MEJOR VALOR POR MÉTRICA DEL ROL
+    role_best = df_norm[metrics].max().tolist()
+
+    N = len(metrics)
+    angles = np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
+    angles += angles[:1]
+
+    player_values += player_values[:1]
+    role_best += role_best[:1]
+
+    fig, ax = plt.subplots(figsize=(7,7), subplot_kw=dict(polar=True))
+
+    # jugador
+    ax.plot(angles, player_values, linewidth=2, label=player_name)
+    ax.fill(angles, player_values, alpha=0.25)
+
+    # rol ideal
+    ax.plot(angles, role_best, linewidth=2, linestyle="--", label="Ideal Rol")
+    ax.fill(angles, role_best, alpha=0.1)
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(metrics, fontsize=9)
+    ax.set_ylim(0,1)
+
+    plt.legend(loc="upper right")
+    st.pyplot(fig)
+
+
 
 def best_player_for_role(role_scores, role, used_players):
     if role in role_scores and not role_scores[role].empty:
@@ -471,6 +698,43 @@ def player_percentiles(players, player_name, role):
         })
 
     return pd.DataFrame(data)
+
+def percentile_color(p):
+
+    if p >= 80:
+        return "#2ecc71"   # verde
+    elif p >= 60:
+        return "#3498db"   # azul
+    elif p >= 40:
+        return "#f1c40f"   # amarillo
+    elif p >= 20:
+        return "#e67e22"   # naranja
+    else:
+        return "#e74c3c"   # rojo
+    
+def plot_percentiles(df_percent):
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    colors = [percentile_color(p) for p in df_percent["Percentil"]]
+
+    ax.barh(
+        df_percent["Métrica"],
+        df_percent["Percentil"],
+        color=colors
+    )
+
+    ax.set_xlim(0, 100)
+    ax.set_xlabel("Percentil")
+    ax.set_title("Rendimiento por Métrica")
+
+    ax.axvline(20, color="grey", linestyle="--", alpha=0.3)
+    ax.axvline(40, color="grey", linestyle="--", alpha=0.3)
+    ax.axvline(60, color="grey", linestyle="--", alpha=0.3)
+    ax.axvline(80, color="grey", linestyle="--", alpha=0.3)
+
+    plt.tight_layout()
+    st.pyplot(fig)    
 
 
 def draw_pitch():
@@ -645,6 +909,50 @@ def plot_formation(formacion, alineacion):
         )
 
     st.pyplot(fig)
+def radar_vs_top_player(players_df, role_scores, player_name, role):
+
+    metrics = [m for m in roles_metrics[role] if m in players_df.columns]
+    if not metrics:
+        return
+
+    df_norm = percentile_normalization(players_df, metrics)
+
+    # jugador seleccionado
+    player_row = df_norm[df_norm["Jugador"] == player_name]
+    if player_row.empty:
+        return
+
+    player_values = player_row.iloc[0][metrics].tolist()
+
+    # TOP REAL DEL ROL
+    top_df = role_scores[role]
+    top_player_name = top_df.iloc[0]["Jugador"]
+
+    top_row = df_norm[df_norm["Jugador"] == top_player_name]
+    top_values = top_row.iloc[0][metrics].tolist()
+
+    N = len(metrics)
+    angles = np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
+    angles += angles[:1]
+
+    player_values += player_values[:1]
+    top_values += top_values[:1]
+
+    fig, ax = plt.subplots(figsize=(7,7), subplot_kw=dict(polar=True))
+
+    ax.plot(angles, player_values, linewidth=2, label=player_name)
+    ax.fill(angles, player_values, alpha=0.25)
+
+    ax.plot(angles, top_values, linewidth=2, linestyle="--", label=f"Top {role}")
+    ax.fill(angles, top_values, alpha=0.1)
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(metrics, fontsize=9)
+    ax.set_ylim(0,1)
+
+    plt.legend(loc="upper right")
+    st.pyplot(fig)
+
     
 # ==========================================================
 # UI
@@ -702,24 +1010,32 @@ if files:
         "Minutos mínimos",
         0,
         int(players["Minutos jugados"].max()),
-        300
+        1000
     )
+    players_filtered_minutes = players[
+        players["Minutos jugados"] >= min_minutes
+    ]
 
     # =========================
     # SCORING
     # =========================
-    role_scores = compute_role_scores(players, min_minutes)
+    role_scores = compute_role_scores(players_filtered_minutes, min_minutes)
 
-    
+    players_filtered_minutes = players[
+    players["Minutos jugados"] >= min_minutes
+    ].copy()
     # =========================
     # TABS
     # =========================
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "🏆 Rankings",
         "🕷 Radar",
         "📋 Alineación",
-        "📊 Percentiles"
+        "📊 Percentiles",
+        "🆚 Comparador",
+        "🎯 Role Fit"
     ])
+
 
 
     # ------------------------------------------------------
@@ -900,8 +1216,102 @@ if files:
                 st.dataframe(df_percent, use_container_width=True)
 
                 # mini gráfico
-                st.bar_chart(
-                    df_percent.set_index("Métrica")
-                )
+                plot_percentiles(df_percent)
+                
             else:
                 st.warning("Sin datos para este jugador.")
+    # ------------------------------------------------------
+    # TAB 5 — COMPARADOR
+    # ------------------------------------------------------
+    with tab5:
+
+        st.subheader("Comparador de Jugadores")
+
+        if role_scores:
+
+            rol_comp = st.selectbox(
+                "Rol",
+                list(role_scores.keys()),
+                key="comp_role"
+            )
+
+            df_role = role_scores[rol_comp]
+
+            jugadores = df_role["Jugador"].tolist()
+
+            jugadores_sel = st.multiselect(
+                "Jugadores a comparar",
+                jugadores,
+                max_selections=10
+            )
+
+            if len(jugadores_sel) >= 2:
+
+                metrics = roles_metrics[rol_comp]
+
+                df_norm = percentile_normalization(df_role, metrics)
+
+                tabla = df_norm[df_norm["Jugador"].isin(jugadores_sel)][
+                    ["Jugador"] + metrics
+                ]
+
+                st.write("### Percentiles comparados")
+                st.dataframe(tabla, use_container_width=True)
+
+            else:
+                st.info("Selecciona mínimo 2 jugadores.")
+   
+    # ------------------------------------------------------
+    # TAB 6 — ROLE FIT
+    # ------------------------------------------------------
+    with tab6:
+
+        st.subheader("🎯 Encaje de jugador por rol")
+
+        if role_scores:
+
+            # SOLO jugadores con minutos mínimos
+            eligible_players = players[
+                players["Minutos jugados"] >= min_minutes
+            ]["Jugador"].unique().tolist()
+
+            player_choice = st.selectbox(
+                "Seleccionar jugador",
+                eligible_players,
+                index=None,
+                placeholder="Selecciona un jugador"
+            )
+
+            if player_choice:
+
+                top_roles = best_roles_for_player_smart(
+                    player_choice,
+                    players,
+                    min_minutes,
+                    top_n=3
+                )
+
+                st.markdown("### Mejores roles")
+
+                for rol, score in top_roles:
+                    st.write(f"**{rol}** — Rating: {score}")
+
+                st.divider()
+                st.markdown("### Comparativa vs Mejor Jugador del Rol")
+
+                cols = st.columns(3)
+
+                for i, (rol, score) in enumerate(top_roles):
+                    with cols[i]:
+                        st.markdown(f"#### {rol} — {score}")
+                        radar_vs_role_top_player(
+                            players,
+                            player_choice,
+                            rol,
+                            min_minutes
+                        )
+
+
+        else:
+            st.warning("Carga datos primero.")
+
