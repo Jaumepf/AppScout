@@ -11,7 +11,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 warnings.filterwarnings("ignore")
 
 st.set_page_config(layout="wide", page_title="Scouting Wyscout Pro")
-st.title("⚽ Scouting & Role Scoring Engine v1.1")
+st.title("⚽ Scouting & Role Scoring Engine v1.2")
 
 # ==========================================================
 # CONFIGURACIÓN
@@ -2384,3 +2384,4 @@ if files:
 
             else:
                 st.info("Elige métricas para los ejes X e Y.")
+
