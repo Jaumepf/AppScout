@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 from matplotlib.patches import Arc, Rectangle, Circle
 from sklearn.metrics.pairwise import cosine_similarity
 
+
 warnings.filterwarnings("ignore")
 
 st.set_page_config(layout="wide", page_title="Scouting Wyscout Pro")
@@ -436,6 +437,33 @@ def add_derived_metrics(df):
     )
 
     return df
+def compute_role_percentiles(players, min_minutes_base=600):
+
+    players = players.copy()
+
+    for rol, weights in pesos_roles_mejorados.items():
+
+        allowed_positions = rol_pos_map.get(rol, [])
+        metrics = list(weights.keys())
+
+        df_role = players[
+            (players["Minutos jugados"] >= min_minutes_base) &
+            (players["Pos_norm"].apply(
+                lambda x: any(p in allowed_positions for p in x)
+            ))
+        ].copy()
+
+        if df_role.empty:
+            continue
+
+        df_norm = percentile_normalization(df_role, metrics)
+
+        for metric in metrics:
+            if metric in df_norm.columns:
+                pct_col = f"{metric}_pct"
+                players.loc[df_norm.index, pct_col] = df_norm[metric]
+
+    return players
 
 # ==========================================================
 # SCORING CON PENALIZACIÓN POR MINUTOS
@@ -448,9 +476,11 @@ def compute_role_scores(players, min_minutes):
     for rol, weights in pesos_roles_mejorados.items():
 
         df = players.copy()
+
+        # 🔹 Filtro por minutos (solo afecta al ranking, no a percentiles)
         df = df[df["Minutos jugados"] >= min_minutes]
 
-        # 🔹 FILTRO POSICIONAL (OBLIGATORIO)
+        # 🔹 Filtro posicional obligatorio
         allowed_positions = rol_pos_map.get(rol, [])
 
         if "Pos_norm" in df.columns:
@@ -467,15 +497,13 @@ def compute_role_scores(players, min_minutes):
         if not metrics:
             continue
 
-        df_norm = percentile_normalization(df, metrics)
-
         scores = []
 
-        for _, row in df_norm.iterrows():
+        for _, row in df.iterrows():
             score = sum(
-                row[m] * weights[m]
+                row.get(f"{m}_pct", 0) * weights[m]
                 for m in metrics
-                if not pd.isna(row[m])
+                if not pd.isna(row.get(f"{m}_pct", 0))
             )
             scores.append(score)
 
@@ -491,42 +519,98 @@ def compute_role_scores(players, min_minutes):
 
 def find_similar_players(players_df, role, player_name, min_minutes, top_n=5):
 
-    df = players_df.copy()
-    df = df[df["Minutos jugados"] >= min_minutes]
+    # -------------------------------------------------
+    # 1️⃣ Filtrar por minutos mínimos
+    # -------------------------------------------------
+    df = players_df[
+        players_df["Minutos jugados"] >= min_minutes
+    ].copy()
 
-    metrics = [m for m in roles_metrics[role] if m in df.columns]
-    if not metrics:
+    # -------------------------------------------------
+    # 2️⃣ Filtrar por posición del rol
+    # -------------------------------------------------
+    allowed_positions = rol_pos_map.get(role, [])
+
+    df = df[
+        df["Pos_norm"].apply(
+            lambda x: any(p in allowed_positions for p in x)
+        )
+    ]
+
+    if df.empty:
         return pd.DataFrame()
 
-    df_norm = percentile_normalization(df, metrics)
+    # -------------------------------------------------
+    # 3️⃣ Métricas del rol (percentiles estables)
+    # -------------------------------------------------
+    weights = pesos_roles_mejorados[role]
 
-    # 🔹 Asegurar numérico
-    df_norm[metrics] = df_norm[metrics].apply(
-        pd.to_numeric, errors="coerce"
-    )
+    pct_metrics = [
+        f"{m}_pct"
+        for m in weights
+        if f"{m}_pct" in df.columns
+    ]
 
-    # 🔹 Reemplazar NaN e infinitos
-    df_norm[metrics] = df_norm[metrics] \
-        .replace([np.inf, -np.inf], np.nan) \
-        .fillna(0)
+    if not pct_metrics:
+        return pd.DataFrame()
 
-    target = df_norm[df_norm["Jugador"] == player_name]
+    # -------------------------------------------------
+    # 4️⃣ Eliminar jugadores con NaN en esas métricas
+    # -------------------------------------------------
+    df = df.dropna(subset=pct_metrics)
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # -------------------------------------------------
+    # 5️⃣ Seleccionar jugador target (solo 1 fila)
+    # -------------------------------------------------
+    target = df[df["Jugador"] == player_name]
+
     if target.empty:
         return pd.DataFrame()
 
-    matrix = df_norm[metrics].values
-    target_vector = target[metrics].values.reshape(1, -1)
+    # 🔹 Si hay duplicados, usar el de más minutos
+    target = target.sort_values(
+        "Minutos jugados",
+        ascending=False
+    ).iloc[0]
 
-    similarities = cosine_similarity(matrix, target_vector).flatten()
+    target_vector = target[pct_metrics].values.reshape(1, -1)
 
-    df_norm["Similarity"] = similarities
-    df_norm = df_norm[df_norm["Jugador"] != player_name]
+    # -------------------------------------------------
+    # 6️⃣ Matriz universo
+    # -------------------------------------------------
+    matrix = df[pct_metrics].values
 
-    return df_norm.sort_values(
-        "Similarity", ascending=False
+    # -------------------------------------------------
+    # 7️⃣ Cosine similarity
+    # -------------------------------------------------
+    similarities = cosine_similarity(
+        matrix,
+        target_vector
+    ).flatten()
+
+    df["Similarity"] = similarities
+
+    # -------------------------------------------------
+    # 8️⃣ Eliminar el propio jugador
+    # -------------------------------------------------
+    df = df[df["Jugador"] != player_name]
+
+    # -------------------------------------------------
+    # 9️⃣ Ordenar y devolver
+    # -------------------------------------------------
+    return df.sort_values(
+        "Similarity",
+        ascending=False
     ).head(top_n)[
-        ["Jugador", "Equipo durante el período seleccionado",
-         "Posición específica", "Similarity"]
+        [
+            "Jugador",
+            "Equipo durante el período seleccionado",
+            "Posición específica",
+            "Similarity"
+        ]
     ]
 # ==========================================================
 # FUNCIONES
@@ -534,15 +618,36 @@ def find_similar_players(players_df, role, player_name, min_minutes, top_n=5):
 
 @st.cache_data
 def load_data(files):
+
     dfs = [pd.read_excel(f) for f in files]
     df = pd.concat(dfs, ignore_index=True)
 
+    # -------------------------------------------------
+    # 🔥 ELIMINAR DUPLICADOS
+    # -------------------------------------------------
+
+    # Si tienes columna Año → usarla
+    if "Año" in df.columns:
+        df = df.sort_values("Minutos jugados", ascending=False)
+        df = df.drop_duplicates(
+            subset=["Jugador", "Equipo durante el período seleccionado", "Año"],
+            keep="first"
+        )
+    else:
+        df = df.sort_values("Minutos jugados", ascending=False)
+        df = df.drop_duplicates(
+            subset=["Jugador", "Equipo durante el período seleccionado"],
+            keep="first"
+        )
+
+    # -------------------------------------------------
+
     if "Posición específica" in df.columns:
         df["Pos_primary"] = (
-        df["Posición específica"]
-        .astype(str)
-        .apply(lambda x: x.split(",")[0].strip().upper())
-    )
+            df["Posición específica"]
+            .astype(str)
+            .apply(lambda x: x.split(",")[0].strip().upper())
+        )
         df["Pos_norm"] = df["Posición específica"].apply(normalize_positions)
     else:
         df["Pos_norm"] = [[] for _ in range(len(df))]
@@ -591,44 +696,45 @@ def best_roles_for_player_smart(player_name, players, min_minutes, top_n=3):
     df = players[players["Minutos jugados"] >= min_minutes].copy()
     results = []
 
-    # --- Detectar posición del jugador ---
     player_row = df[df["Jugador"] == player_name]
     if player_row.empty:
         return []
 
     player_positions = player_row.iloc[0]["Pos_norm"]
-
     is_gk = "GK" in player_positions
 
-    # --- Definir roles permitidos ---
     if is_gk:
         allowed_roles = ["Portero", "Portero_Avanzado"]
     else:
-        allowed_roles = list(pesos_roles_mejorados.keys())
+        allowed_roles = [
+            rol for rol, pos_list in rol_pos_map.items()
+            if any(p in player_positions for p in pos_list)
+    ]
 
-    # --- Calcular scores ---
     for rol in allowed_roles:
 
         weights = pesos_roles_mejorados[rol]
-        metrics = [m for m in weights if m in df.columns]
+        metrics = [m for m in weights if f"{m}_pct" in df.columns]
 
         if not metrics:
             continue
 
-        df_norm = percentile_normalization(df, metrics)
-        row = df_norm[df_norm["Jugador"] == player_name]
-
+        row = df[df["Jugador"] == player_name]
         if row.empty:
             continue
 
         row = row.iloc[0]
-        score = sum(row[m] * weights[m] for m in metrics if not pd.isna(row[m]))
+
+        score = sum(
+            row.get(f"{m}_pct", 0) * weights[m]
+            for m in metrics
+            if not pd.isna(row.get(f"{m}_pct", 0))
+        )
 
         results.append((rol, round(score * 10, 2)))
 
     results = sorted(results, key=lambda x: x[1], reverse=True)
 
-    # GK solo 2 roles
     if is_gk:
         return results[:2]
 
@@ -636,118 +742,85 @@ def best_roles_for_player_smart(player_name, players, min_minutes, top_n=3):
 
 def radar_plot(df, role, players_selected):
 
-    metrics = roles_metrics[role]
-    df_norm = percentile_normalization(df, metrics)
+    weights = pesos_roles_mejorados[role]
+    pct_metrics = [f"{m}_pct" for m in weights if f"{m}_pct" in df.columns]
 
-    N = len(metrics)
+    if not pct_metrics:
+        st.warning("No hay métricas disponibles para este rol.")
+        return
+
+    N = len(pct_metrics)
     angles = np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
     angles += angles[:1]
 
     fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
 
-    # FONDO CLARO
-    fig.patch.set_facecolor("white")
-    ax.set_facecolor("#f5f5f5")
+    for player in players_selected:
 
-    colors = ["#1f77b4", "#ff7f0e", "#2ecc71", "#e74c3c"]
-
-    for i, player in enumerate(players_selected):
-
-        row = df_norm[df_norm["Jugador"] == player]
+        row = df[df["Jugador"] == player]
         if row.empty:
             continue
 
-        values = row[metrics].iloc[0].tolist()
+        values = row.iloc[0][pct_metrics].tolist()
         values += values[:1]
 
-        ax.plot(
-            angles,
-            values,
-            linewidth=2.5,
-            color=colors[i % len(colors)],
-            label=player
-        )
+        ax.plot(angles, values, linewidth=2, label=player)
+        ax.fill(angles, values, alpha=0.15)
 
-        ax.fill(
-            angles,
-            values,
-            alpha=0.15,
-            color=colors[i % len(colors)]
-        )
-
-    # ETIQUETAS REALES (sin recortar)
     ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(metrics, fontsize=10, color="black")
-
-    ax.set_ylim(0, 1)
-
-    # REJILLA SUAVE
-    ax.yaxis.grid(True, color="gray", alpha=0.25)
-    ax.xaxis.grid(True, color="gray", alpha=0.25)
-
-    # QUITAR NÚMEROS RADIALES
+    ax.set_xticklabels([m.replace("_pct","") for m in pct_metrics], fontsize=9)
+    ax.set_ylim(0,1)
     ax.set_yticklabels([])
 
-    # LEYENDA ABAJO Y VISIBLE
-    plt.legend(
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.08),
-        ncol=2,
-        frameon=False,
-        fontsize=11
-    )
-
-    # TÍTULO SIMPLE
-    plt.title(
-        f"Radar comparativo – {role}",
-        fontsize=14,
-        pad=20
-    )
-
-    plt.tight_layout()
+    plt.legend(loc="upper right")
     st.pyplot(fig)
     
-def radar_vs_role_top_player(players, player_name, role, min_minutes):
+def radar_vs_role_top_player(players_df, player_name, role, min_minutes):
 
-    df = players[players["Minutos jugados"] >= min_minutes].copy()
+    df = players_df[players_df["Minutos jugados"] >= min_minutes].copy()
 
-    metrics = roles_metrics[role]
-    metrics = [m for m in metrics if m in df.columns]
+    # 🔹 Filtrar por posición del rol
+    allowed_positions = rol_pos_map.get(role, [])
+    df = df[df["Pos_norm"].apply(lambda x: any(p in allowed_positions for p in x))]
 
-    if not metrics:
+    if df.empty:
         return
 
-    df_norm = percentile_normalization(df, metrics)
+    # 🔹 Usar percentiles ya calculados
+    weights = pesos_roles_mejorados[role]
+    pct_metrics = [f"{m}_pct" for m in weights if f"{m}_pct" in df.columns]
 
-    player_row = df_norm[df_norm["Jugador"] == player_name]
+    if not pct_metrics:
+        return
+
+    player_row = df[df["Jugador"] == player_name]
     if player_row.empty:
         return
 
-    # MEJOR JUGADOR DEL ROL POR SCORE
-    weights = pesos_roles_mejorados[role]
-
+    # 🔹 Score estable
     scores = []
-    for _, row in df_norm.iterrows():
-        s = sum(row[m] * weights[m] for m in metrics if not pd.isna(row[m]))
+    for _, row in df.iterrows():
+        s = sum(
+            row.get(m, 0) * weights[m.replace("_pct","")]
+            for m in pct_metrics
+        )
         scores.append(s)
 
-    df_norm["Score"] = scores
-    top_player = df_norm.sort_values("Score", ascending=False).iloc[0]["Jugador"]
+    df["Score"] = scores
+    top_player = df.sort_values("Score", ascending=False).iloc[0]["Jugador"]
 
-    top_row = df_norm[df_norm["Jugador"] == top_player]
+    top_row = df[df["Jugador"] == top_player]
 
-    p_vals = player_row.iloc[0][metrics].tolist()
-    t_vals = top_row.iloc[0][metrics].tolist()
+    p_vals = player_row.iloc[0][pct_metrics].tolist()
+    t_vals = top_row.iloc[0][pct_metrics].tolist()
 
-    angles = np.linspace(0, 2*np.pi, len(metrics), endpoint=False).tolist()
+    angles = np.linspace(0, 2*np.pi, len(pct_metrics), endpoint=False).tolist()
     angles += angles[:1]
 
     p_vals += p_vals[:1]
     t_vals += t_vals[:1]
 
     fig, ax = plt.subplots(figsize=(5,5), subplot_kw=dict(polar=True))
-    fig.patch.set_facecolor("white")
-    ax.set_facecolor("#f4f4f4")
 
     ax.plot(angles, p_vals, linewidth=2, label=player_name)
     ax.fill(angles, p_vals, alpha=0.15)
@@ -756,7 +829,7 @@ def radar_vs_role_top_player(players, player_name, role, min_minutes):
     ax.fill(angles, t_vals, alpha=0.1)
 
     ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(metrics, fontsize=8)
+    ax.set_xticklabels([m.replace("_pct","") for m in pct_metrics], fontsize=8)
     ax.set_ylim(0,1)
     ax.set_yticklabels([])
 
@@ -771,7 +844,6 @@ def radar_vs_role_top_player(players, player_name, role, min_minutes):
 
     plt.tight_layout()
     st.pyplot(fig)
-
     
 def radar_vs_role_best(players_df, player_name, role):
     metrics = roles_metrics[role]
@@ -879,8 +951,10 @@ def best_player_for_role(role_scores, role, used_players, side=None):
     return df_full.iloc[0]["Jugador"]
 def player_percentiles(players, player_name, role):
 
-    metrics = roles_metrics.get(role, [])
-    if not metrics:
+    weights = pesos_roles_mejorados.get(role, {})
+    pct_metrics = [f"{m}_pct" for m in weights if f"{m}_pct" in players.columns]
+
+    if not pct_metrics:
         return pd.DataFrame()
 
     row = players[players["Jugador"] == player_name]
@@ -891,19 +965,10 @@ def player_percentiles(players, player_name, role):
 
     data = []
 
-    for m in metrics:
-        if m not in players.columns:
-            continue
-
-        distribution = players[m].dropna()
-        if len(distribution) == 0:
-            continue
-
-        player_value = row[m]
-        percentile = (distribution < player_value).mean() * 100
-
+    for m in pct_metrics:
+        percentile = row.get(m, 0) * 100
         data.append({
-            "Métrica": m,
+            "Métrica": m.replace("_pct", ""),
             "Percentil": round(percentile, 1)
         })
 
@@ -1171,27 +1236,25 @@ def plot_formation(formacion, alineacion, role_scores):
 
 def radar_vs_top_player(players_df, role_scores, player_name, role):
 
-    metrics = [m for m in roles_metrics[role] if m in players_df.columns]
-    if not metrics:
+    weights = pesos_roles_mejorados[role]
+    pct_metrics = [f"{m}_pct" for m in weights if f"{m}_pct" in players_df.columns]
+
+    if not pct_metrics:
         return
 
-    df_norm = percentile_normalization(players_df, metrics)
-
-    # jugador seleccionado
-    player_row = df_norm[df_norm["Jugador"] == player_name]
+    player_row = players_df[players_df["Jugador"] == player_name]
     if player_row.empty:
         return
 
-    player_values = player_row.iloc[0][metrics].tolist()
+    player_values = player_row.iloc[0][pct_metrics].tolist()
 
-    # TOP REAL DEL ROL
     top_df = role_scores[role]
     top_player_name = top_df.iloc[0]["Jugador"]
 
-    top_row = df_norm[df_norm["Jugador"] == top_player_name]
-    top_values = top_row.iloc[0][metrics].tolist()
+    top_row = players_df[players_df["Jugador"] == top_player_name]
+    top_values = top_row.iloc[0][pct_metrics].tolist()
 
-    N = len(metrics)
+    N = len(pct_metrics)
     angles = np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
     angles += angles[:1]
 
@@ -1207,7 +1270,7 @@ def radar_vs_top_player(players_df, role_scores, player_name, role):
     ax.fill(angles, top_values, alpha=0.1)
 
     ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(metrics, fontsize=9)
+    ax.set_xticklabels([m.replace("_pct","") for m in pct_metrics], fontsize=9)
     ax.set_ylim(0,1)
 
     plt.legend(loc="upper right")
@@ -1418,6 +1481,183 @@ def stripplot_role_metrics(players_df, role, player_name, min_minutes):
 
         st.plotly_chart(fig, use_container_width=True)
 
+def scatter_role_universe_export(df, x_metric, y_metric, highlight_player, output_path):
+
+    if x_metric not in df.columns or y_metric not in df.columns:
+        return
+
+    fig, ax = plt.subplots(figsize=(6,6))
+
+    ax.scatter(
+        df[x_metric],
+        df[y_metric],
+        alpha=0.4
+    )
+
+    player_row = df[df["Jugador"] == highlight_player]
+
+    if not player_row.empty:
+        ax.scatter(
+            player_row[x_metric],
+            player_row[y_metric],
+            s=150
+        )
+
+    ax.set_xlabel(x_metric)
+    ax.set_ylabel(y_metric)
+    ax.set_title(f"{x_metric} vs {y_metric}")
+
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close(fig)
+
+def generate_player_report(
+    filename,
+    player_name,
+    role_fit_data,
+    percentiles_df,
+    similar_df,
+    players_df=None,
+    role=None,
+    min_minutes=None
+):
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib import pagesizes
+    from reportlab.lib.units import inch
+    import os
+
+    doc = SimpleDocTemplate(filename, pagesize=pagesizes.A4)
+    elements = []
+    styles = getSampleStyleSheet()
+
+    # ================================
+    # TÍTULO
+    # ================================
+    elements.append(Paragraph("<b>Informe Scouting</b>", styles["Title"]))
+    elements.append(Spacer(1, 0.3 * inch))
+
+    elements.append(Paragraph(f"<b>Jugador:</b> {player_name}", styles["Heading2"]))
+    elements.append(Spacer(1, 0.3 * inch))
+
+    # ================================
+    # ROLE FIT
+    # ================================
+    elements.append(Paragraph("<b>Role Fit</b>", styles["Heading2"]))
+    elements.append(Spacer(1, 0.2 * inch))
+
+    if role_fit_data:
+        role_table_data = [["Rol", "Rating"]]
+        for rol, score in role_fit_data:
+            role_table_data.append([rol, score])
+
+        table = Table(role_table_data)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.grey),
+            ('TEXTCOLOR',(0,0),(-1,0),colors.white),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.black)
+        ]))
+        elements.append(table)
+
+    elements.append(Spacer(1, 0.4 * inch))
+
+    # ================================
+    # PERCENTILES
+    # ================================
+    elements.append(Paragraph("<b>Percentiles</b>", styles["Heading2"]))
+    elements.append(Spacer(1, 0.2 * inch))
+
+    if not percentiles_df.empty:
+        percent_table_data = [["Métrica", "Percentil"]]
+
+        for _, row in percentiles_df.iterrows():
+            percent_table_data.append([
+                row["Métrica"],
+                row["Percentil"]
+            ])
+
+        table = Table(percent_table_data)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.grey),
+            ('TEXTCOLOR',(0,0),(-1,0),colors.white),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.black)
+        ]))
+        elements.append(table)
+
+    elements.append(Spacer(1, 0.4 * inch))
+
+    # ================================
+    # SIMILARIDAD
+    # ================================
+    elements.append(Paragraph("<b>Jugadores Similares</b>", styles["Heading2"]))
+    elements.append(Spacer(1, 0.2 * inch))
+
+    if not similar_df.empty:
+        sim_table_data = [["Jugador", "Equipo", "Similarity"]]
+
+        for _, row in similar_df.iterrows():
+            sim_table_data.append([
+                row["Jugador"],
+                row["Equipo durante el período seleccionado"],
+                round(row["Similarity"], 3)
+            ])
+
+        table = Table(sim_table_data)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.grey),
+            ('TEXTCOLOR',(0,0),(-1,0),colors.white),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.black)
+        ]))
+        elements.append(table)
+
+    elements.append(Spacer(1, 0.4 * inch))
+
+    # ================================
+    # SCATTER
+    # ================================
+    elements.append(Spacer(1, 0.4 * inch))
+    elements.append(Paragraph("<b>Scatter Análisis</b>", styles["Heading2"]))
+    elements.append(Spacer(1, 0.2 * inch))
+
+    weights = pesos_roles_mejorados[role]
+
+    # métricas del rol que existan realmente
+    available_metrics = [
+        m for m in weights
+        if m in players_df.columns
+    ]
+
+    if len(available_metrics) >= 2:
+
+        # ordenar por peso
+        sorted_metrics = sorted(
+            available_metrics,
+            key=lambda x: weights[x],
+            reverse=True
+        )
+
+        x_metric = sorted_metrics[0]
+        y_metric = sorted_metrics[1]
+
+        df_role = players_df[
+            players_df["Minutos jugados"] >= min_minutes
+        ].copy()
+
+        scatter_path = "scatter_temp.png"
+
+        scatter_role_universe_export(
+            df_role,
+            x_metric,
+            y_metric,
+            player_name,
+            scatter_path
+        )
+
+        if os.path.exists(scatter_path):
+            elements.append(Image(scatter_path, width=4*inch, height=4*inch))
+            os.remove(scatter_path)
+
 # ==========================================================
 # UI
 # ==========================================================
@@ -1431,17 +1671,22 @@ files = st.sidebar.file_uploader(
 
 if files:
 
-    players = load_data(files)
-    players = add_derived_metrics(players)
+    players_master = load_data(files)
+    players_master = add_derived_metrics(players_master)
+    players_master = compute_role_percentiles(players_master, min_minutes_base=600)
 
+    pct_cols = [col for col in players_master.columns if col.endswith("_pct")]
+    players_master[pct_cols] = players_master[pct_cols].fillna(0)
+
+    players = players_master.copy()
     # =========================
     # FILTROS
     # =========================
 
     st.sidebar.divider()
     st.sidebar.subheader("🔎 Filtros")
-   
-    # MINUTOS 
+
+    # MINUTOS (siempre activo, sin checkbox)
     min_minutes = st.sidebar.slider(
         "Minutos mínimos",
         0,
@@ -1449,31 +1694,29 @@ if files:
         1000
     )
 
-    players_filtered_minutes = players[
-        players["Minutos jugados"] >= min_minutes
-    ].copy()
-
     # EDAD
     if "Edad" in players.columns:
+        usar_edad = st.sidebar.checkbox("Filtrar por Edad", value=False)
         edad_min, edad_max = st.sidebar.slider(
             "Edad",
             int(players["Edad"].min()),
             int(players["Edad"].max()),
-            (18, 35)
+            (18, 35),
+            disabled=not usar_edad
         )
-        players = players[
-            (players["Edad"] >= edad_min) &
-            (players["Edad"] <= edad_max)
-        ]
+        if usar_edad:
+            players = players[
+                (players["Edad"] >= edad_min) &
+                (players["Edad"] <= edad_max)
+            ]
+
     # VALOR DE MERCADO
     if "Valor de mercado (Transfermarkt)" in players.columns:
 
-        # Limpiar posibles strings tipo "€10m"
         players["Valor de mercado (Transfermarkt)"] = (
             players["Valor de mercado (Transfermarkt)"]
             .replace('[€,mM]', '', regex=True)
         )
-
         players["Valor de mercado (Transfermarkt)"] = pd.to_numeric(
             players["Valor de mercado (Transfermarkt)"],
             errors="coerce"
@@ -1482,17 +1725,21 @@ if files:
         min_val = float(players["Valor de mercado (Transfermarkt)"].min())
         max_val = float(players["Valor de mercado (Transfermarkt)"].max())
 
-        market_min, market_max = st.sidebar.slider(
-            "Valor de mercado (€ millones)",
-            min_val,
-            max_val,
-            (min_val, max_val)
-        )
+        if min_val < max_val:
+            usar_mercado = st.sidebar.checkbox("Filtrar por Valor de Mercado", value=False)
+            market_min, market_max = st.sidebar.slider(
+                "Valor de mercado (€ millones)",
+                min_val,
+                max_val,
+                (min_val, max_val),
+                disabled=not usar_mercado
+            )
+            if usar_mercado:
+                players = players[
+                    (players["Valor de mercado (Transfermarkt)"] >= market_min) &
+                    (players["Valor de mercado (Transfermarkt)"] <= market_max)
+                ]
 
-        players = players[
-            (players["Valor de mercado (Transfermarkt)"] >= market_min) &
-            (players["Valor de mercado (Transfermarkt)"] <= market_max)
-        ]
     # VENCIMIENTO CONTRATO
     if "Vencimiento contrato" in players.columns:
 
@@ -1500,45 +1747,55 @@ if files:
             players["Vencimiento contrato"],
             errors="coerce"
         )
-
         years_to_expiry = (
             players["Vencimiento contrato"] - pd.Timestamp.today()
         ).dt.days / 365
 
+        usar_contrato = st.sidebar.checkbox("Filtrar por Contrato", value=False)
         max_years = st.sidebar.slider(
             "Contrato vence en ≤ años",
             0.0,
             5.0,
-            2.0
+            2.0,
+            disabled=not usar_contrato
         )
+        if usar_contrato:
+            players = players.loc[years_to_expiry[years_to_expiry <= max_years].index]
 
-        players = players[years_to_expiry <= max_years]
     # PIE
     if "Pie" in players.columns:
         pies = sorted(players["Pie"].dropna().unique())
-        pie_sel = st.sidebar.multiselect("Pie dominante", pies)
-        if pie_sel:
-            players = players[players["Pie"].isin(pie_sel)]
+        usar_pie = st.sidebar.checkbox("Filtrar por Pie dominante", value=False)
+        if usar_pie:
+            pie_sel = st.sidebar.multiselect("Pie dominante", pies)
+            if pie_sel:
+                players = players[players["Pie"].isin(pie_sel)]
 
     # COMPETICIÓN
     if "Competición" in players.columns:
         comps = sorted(players["Competición"].dropna().unique())
-        comp_sel = st.sidebar.multiselect("Competición", comps)
-        if comp_sel:
-            players = players[players["Competición"].isin(comp_sel)]
+        usar_comp = st.sidebar.checkbox("Filtrar por Competición", value=False)
+        if usar_comp:
+            comp_sel = st.sidebar.multiselect("Competición", comps)
+            if comp_sel:
+                players = players[players["Competición"].isin(comp_sel)]
 
     # AÑO
     if "Año" in players.columns:
         years = sorted(players["Año"].dropna().unique())
-        year_sel = st.sidebar.multiselect("Año", years)
-        if year_sel:
-            players = players[players["Año"].isin(year_sel)]
+        usar_año = st.sidebar.checkbox("Filtrar por Año", value=False)
+        if usar_año:
+            year_sel = st.sidebar.multiselect("Año", years)
+            if year_sel:
+                players = players[players["Año"].isin(year_sel)]
 
 
     # =========================
     # SCORING
     # =========================
 
+    # players_master = universo completo para scoring y percentiles
+    # players = subconjunto filtrado, solo para los selectboxes de jugador
     role_scores = compute_role_scores(
         players,
         min_minutes
@@ -1546,16 +1803,17 @@ if files:
     # =========================
     # TABS
     # =========================
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "🏆 Rankings",
         "🕷 Radar",
         "📋 Alineación",
         "📊 Percentiles",
         "🆚 Comparador",
         "🎯 Role Fit",
-        "📍 Scatter",
-        "🔎 Similaridad"
-    ])
+        "📍 Strip Plot",
+        "🔎 Similaridad",
+        "🔵 Scatter"
+        ])
 
 
 
@@ -1567,21 +1825,23 @@ if files:
         st.subheader("Ranking por Rol")
 
         if role_scores:
-            selected_role = st.selectbox("Rol", list(role_scores.keys()), key="rank")
-            df_role = role_scores[selected_role]
+            selected_role = st.selectbox("Rol", list(role_scores.keys()), key="rank", index=None, placeholder="Elige un rol...")
 
-            # 🔥 Mostrar solo jugadores con Rating válido
-            df_role = df_role[df_role["Rating"].notna()]
+            if selected_role:
+                df_role = role_scores[selected_role]
 
-            st.dataframe(
-                df_role[[
-                    "Jugador",
-                    "Equipo durante el período seleccionado",
-                    "Minutos jugados",
-                    "Rating"
-                ]],
-                use_container_width=True
-            )
+                # 🔥 Mostrar solo jugadores con Rating válido
+                df_role = df_role[df_role["Rating"].notna()]
+
+                st.dataframe(
+                    df_role[[
+                        "Jugador",
+                        "Equipo durante el período seleccionado",
+                        "Minutos jugados",
+                        "Rating"
+                    ]],
+                    use_container_width=True
+                )
 
     # ------------------------------------------------------
     # TAB 2 — RADAR
@@ -1591,15 +1851,17 @@ if files:
         st.subheader("Radar Comparativo")
 
         if role_scores:
-            selected_role = st.selectbox("Rol Radar", list(role_scores.keys()), key="radar_role")
-            df_role = role_scores[selected_role]
+            selected_role = st.selectbox("Rol Radar", list(role_scores.keys()), key="radar_role", index=None, placeholder="Elige un rol...")
 
-            players_list = df_role["Jugador"].tolist()
+            if selected_role:
+                df_role = role_scores[selected_role]
 
-            selected_players = st.multiselect("Jugadores", players_list)
+                players_list = df_role["Jugador"].tolist()
 
-            if selected_players:
-                radar_plot(df_role, selected_role, selected_players)
+                selected_players = st.multiselect("Jugadores", players_list, placeholder="Elige jugadores...")
+
+                if selected_players:
+                    radar_plot(df_role, selected_role, selected_players)
 
     # ------------------------------------------------------
     # TAB 3 — ALINEACIÓN
@@ -1735,29 +1997,34 @@ if files:
             selected_player = st.selectbox(
                 "Jugador",
                 all_players,
-                key="percent_player"
+                key="percent_player",
+                index=None,
+                placeholder="Elige un jugador..."
             )
 
             selected_role = st.selectbox(
                 "Rol",
                 list(role_scores.keys()),
-                key="percent_role"
+                key="percent_role",
+                index=None,
+                placeholder="Elige un rol..."
             )
 
-            df_percent = player_percentiles(
-                players,
-                selected_player,
-                selected_role
-            )
+            if selected_player and selected_role:
+                df_percent = player_percentiles(
+                    players,
+                    selected_player,
+                    selected_role
+                )
 
-            if not df_percent.empty:
-                st.dataframe(df_percent, use_container_width=True)
+                if not df_percent.empty:
+                    st.dataframe(df_percent, use_container_width=True)
 
-                # mini gráfico
-                plot_percentiles(df_percent)
-                
-            else:
-                st.warning("Sin datos para este jugador.")
+                    # mini gráfico
+                    plot_percentiles(df_percent)
+                    
+                else:
+                    st.warning("Sin datos para este jugador.")
     # ------------------------------------------------------
     # TAB 5 — COMPARADOR
     # ------------------------------------------------------
@@ -1770,36 +2037,40 @@ if files:
             rol_comp = st.selectbox(
                 "Rol",
                 list(role_scores.keys()),
-                key="comp_role"
+                key="comp_role",
+                index=None,
+                placeholder="Elige un rol..."
             )
 
-            df_role = role_scores[rol_comp]
+            if rol_comp:
+                df_role = role_scores[rol_comp]
 
-            jugadores = df_role["Jugador"].tolist()
+                jugadores = df_role["Jugador"].tolist()
 
-            jugadores_sel = st.multiselect(
-                "Jugadores a comparar",
-                jugadores,
-                max_selections=10
-            )
+                jugadores_sel = st.multiselect(
+                    "Jugadores a comparar",
+                    jugadores,
+                    max_selections=10,
+                    placeholder="Elige jugadores..."
+                )
 
-            if len(jugadores_sel) >= 2:
+                if len(jugadores_sel) >= 2:
 
-                metrics = [
-                    m for m in roles_metrics[rol_comp]
-                    if m in df_role.columns
-                ]
+                    metrics = [
+                        m for m in roles_metrics[rol_comp]
+                        if m in df_role.columns
+                    ]
 
-                # 🔥 VALORES REALES (NO NORMALIZADOS)
-                tabla_real = df_role[
-                    df_role["Jugador"].isin(jugadores_sel)
-                ][["Jugador"] + metrics]
+                    # 🔥 VALORES REALES (NO NORMALIZADOS)
+                    tabla_real = df_role[
+                        df_role["Jugador"].isin(jugadores_sel)
+                    ][["Jugador"] + metrics]
 
-                st.write("### Métricas reales")
-                st.dataframe(tabla_real, use_container_width=True)
+                    st.write("### Métricas reales")
+                    st.dataframe(tabla_real, use_container_width=True)
 
-            else:
-                st.info("Selecciona mínimo 2 jugadores.")
+                else:
+                    st.info("Selecciona mínimo 2 jugadores.")
    
     # ------------------------------------------------------
     # TAB 6 — ROLE FIT
@@ -1823,13 +2094,12 @@ if files:
             )
 
             if player_choice:
-
                 top_roles = best_roles_for_player_smart(
                     player_choice,
                     players,
                     min_minutes,
                     top_n=3
-                )
+)
 
                 st.markdown("### Mejores roles")
 
@@ -1863,29 +2133,57 @@ if files:
 
         if role_scores:
 
-            # jugador elegible por minutos
-            eligible_players = players[
-                players["Minutos jugados"] >= min_minutes
-            ]["Jugador"].unique().tolist()
-
-            selected_player = st.selectbox(
-                "Seleccionar jugador",
-                eligible_players
-            )
-
+            # 1️⃣ Primero elegir rol
             selected_role = st.selectbox(
                 "Seleccionar rol",
-                list(role_scores.keys())
+                list(role_scores.keys()),
+                index=None,
+                placeholder="Elige un rol...",
+                key="strip_role"
             )
 
-            if selected_player and selected_role:
+            if selected_role:
 
-                stripplot_role_metrics(
-                    players,
-                    selected_role,
-                    selected_player,
-                    min_minutes
+                # 2️⃣ Todas las posiciones disponibles en los datos (sin limitar al rol)
+                pos_disponibles = sorted(set(
+                    pos
+                    for pos_list in players["Pos_norm"]
+                    for pos in pos_list
+                ))
+
+                selected_positions = st.multiselect(
+                    "Filtrar por posición",
+                    pos_disponibles,
+                    key="strip_positions",
+                    placeholder="Elige posiciones (vacío = todas)..."
                 )
+
+                # Si no se elige ninguna, usar todas
+                filtro_pos = selected_positions if selected_positions else pos_disponibles
+
+                # 3️⃣ Jugadores filtrados por posición y minutos
+                eligible_players = players[
+                    (players["Minutos jugados"] >= min_minutes) &
+                    (players["Pos_norm"].apply(
+                        lambda x: any(p in filtro_pos for p in x)
+                    ))
+                ]["Jugador"].unique().tolist()
+
+                selected_player = st.selectbox(
+                    "Seleccionar jugador",
+                    eligible_players,
+                    index=None,
+                    placeholder="Elige un jugador...",
+                    key="strip_player"
+                )
+
+                if selected_player:
+                    stripplot_role_metrics(
+                        players,
+                        selected_role,
+                        selected_player,
+                        min_minutes
+                    )
 # ------------------------------------------------------
 # TAB 8 — Similaridad
 # ------------------------------------------------------    
@@ -1897,9 +2195,9 @@ if files:
             players["Minutos jugados"] >= min_minutes
         ]["Jugador"].unique().tolist()
 
-        selected_player = st.selectbox("Jugador", eligible_players)
+        selected_player = st.selectbox("Jugador", eligible_players, index=None, placeholder="Elige un jugador...")
 
-        selected_role = st.selectbox("Rol", list(role_scores.keys()))
+        selected_role = st.selectbox("Rol", list(role_scores.keys()), index=None, placeholder="Elige un rol...")
 
         if selected_player and selected_role:
 
@@ -1915,3 +2213,174 @@ if files:
                 st.dataframe(similar_df, use_container_width=True)
             else:
                 st.warning("No se encontraron similares.")
+
+# ------------------------------------------------------
+# TAB 9 — SCATTER LIBRE
+# ------------------------------------------------------
+    with tab9:
+
+        st.subheader("🔵 Scatter Plot")
+
+        if role_scores:
+
+            col_ctrl1, col_ctrl2, col_ctrl3 = st.columns(3)
+
+            with col_ctrl1:
+                rol_scatter = st.selectbox(
+                    "Filtrar por rol (opcional)",
+                    ["Todos"] + list(role_scores.keys()),
+                    key="scatter_rol"
+                )
+
+            if rol_scatter == "Todos":
+                df_scatter = players[players["Minutos jugados"] >= min_minutes].copy()
+            else:
+                df_scatter = role_scores[rol_scatter].copy()
+
+            numeric_cols = sorted([
+                c for c in df_scatter.select_dtypes(include="number").columns
+                if not c.endswith("_pct") and c not in ["Minutos jugados"]
+            ])
+
+            with col_ctrl2:
+                x_metric = st.selectbox(
+                    "Eje X", numeric_cols, key="scatter_x",
+                    index=None, placeholder="Elige métrica..."
+                )
+
+            with col_ctrl3:
+                y_metric = st.selectbox(
+                    "Eje Y", numeric_cols, key="scatter_y",
+                    index=None, placeholder="Elige métrica..."
+                )
+
+            col_ctrl4, col_ctrl5 = st.columns(2)
+
+            with col_ctrl4:
+                color_by = st.selectbox(
+                    "Color por",
+                    ["Rating", "Posición", "Ninguno"],
+                    key="scatter_color"
+                )
+
+            with col_ctrl5:
+                highlight_player = st.selectbox(
+                    "Destacar jugador (opcional)",
+                    ["Ninguno"] + df_scatter["Jugador"].tolist(),
+                    key="scatter_highlight"
+                )
+
+            if x_metric and y_metric:
+
+                keep_cols = ["Jugador", x_metric, y_metric]
+                if "Rating" in df_scatter.columns:
+                    keep_cols.append("Rating")
+                if "Pos_primary" in df_scatter.columns:
+                    keep_cols.append("Pos_primary")
+
+                df_plot = df_scatter[keep_cols].dropna(subset=[x_metric, y_metric])
+
+                fig = go.Figure()
+
+                if color_by == "Rating" and "Rating" in df_plot.columns:
+                    marker_color = df_plot["Rating"]
+                    colorscale = "RdYlGn"
+                    showscale = True
+                    colorbar = dict(title="Rating")
+                elif color_by == "Posición" and "Pos_primary" in df_plot.columns:
+                    positions = df_plot["Pos_primary"].unique().tolist()
+                    palette = ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd",
+                               "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf"]
+                    pos_color_map = {p: palette[i % len(palette)] for i, p in enumerate(positions)}
+                    marker_color = df_plot["Pos_primary"].map(pos_color_map)
+                    showscale = False
+                    colorscale = None
+                    colorbar = None
+                else:
+                    marker_color = "#1f77b4"
+                    showscale = False
+                    colorscale = None
+                    colorbar = None
+
+                mask_highlight = (
+                    df_plot["Jugador"] == highlight_player
+                    if highlight_player != "Ninguno"
+                    else pd.Series([False] * len(df_plot), index=df_plot.index)
+                )
+
+                df_normal = df_plot[~mask_highlight]
+                colors_normal = (
+                    marker_color[~mask_highlight]
+                    if hasattr(marker_color, "__getitem__") and not isinstance(marker_color, str)
+                    else marker_color
+                )
+
+                fig.add_trace(go.Scatter(
+                    x=df_normal[x_metric],
+                    y=df_normal[y_metric],
+                    mode="markers",
+                    marker=dict(
+                        size=9,
+                        color=colors_normal,
+                        colorscale=colorscale,
+                        showscale=showscale,
+                        colorbar=colorbar,
+                        opacity=0.7,
+                        line=dict(width=0.5, color="white")
+                    ),
+                    text=df_normal["Jugador"],
+                    hovertemplate=(
+                        "<b>%{text}</b><br>"
+                        + f"{x_metric}: %{{x:.2f}}<br>"
+                        + f"{y_metric}: %{{y:.2f}}<extra></extra>"
+                    ),
+                    showlegend=False
+                ))
+
+                if highlight_player != "Ninguno":
+                    df_hl = df_plot[mask_highlight]
+                    if not df_hl.empty:
+                        fig.add_trace(go.Scatter(
+                            x=df_hl[x_metric],
+                            y=df_hl[y_metric],
+                            mode="markers+text",
+                            marker=dict(
+                                size=18,
+                                color="#e74c3c",
+                                line=dict(width=2, color="black")
+                            ),
+                            text=df_hl["Jugador"],
+                            textposition="top center",
+                            hovertemplate=(
+                                "<b>%{text}</b><br>"
+                                + f"{x_metric}: %{{x:.2f}}<br>"
+                                + f"{y_metric}: %{{y:.2f}}<extra></extra>"
+                            ),
+                            showlegend=False
+                        ))
+
+                fig.add_vline(
+                    x=df_plot[x_metric].mean(),
+                    line_dash="dash", line_color="gray", opacity=0.4,
+                    annotation_text="media X", annotation_position="top right"
+                )
+                fig.add_hline(
+                    y=df_plot[y_metric].mean(),
+                    line_dash="dash", line_color="gray", opacity=0.4,
+                    annotation_text="media Y", annotation_position="top right"
+                )
+
+                fig.update_layout(
+                    title=f"{x_metric}  vs  {y_metric}",
+                    xaxis_title=x_metric,
+                    yaxis_title=y_metric,
+                    template="simple_white",
+                    height=600,
+                    margin=dict(l=60, r=40, t=60, b=60)
+                )
+
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption(f"Mostrando {len(df_plot)} jugadores")
+
+            else:
+                st.info("Elige métricas para los ejes X e Y.")
